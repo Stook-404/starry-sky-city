@@ -1,5 +1,20 @@
 # 星穹城境 · 3D 城市生成器
 
+[![在线试玩](https://img.shields.io/badge/%E5%9C%A8%E7%BA%BF%E8%AF%95%E7%8E%A9-Live%20Demo-2ea44f?style=for-the-badge)](https://stook-404.github.io/starry-sky-city/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Three.js](https://img.shields.io/badge/Three.js-r161-black.svg)](https://threejs.org/)
+
+> ### ▶ [**点此在线试玩**](https://stook-404.github.io/starry-sky-city/)
+> 无需安装、无需后端，浏览器打开即可生成属于你的 3D 城市。
+
+![生成的 7 km 城市](screenshots/city-7km.png)
+
+*上图由线上站点实时生成：直径 7 km，237 栋建筑，8 座桥，含湖泊、河流、公园与工业设施。*
+
+## 界面
+
+![首页](screenshots/landing.png)
+
 一个纯前端、程序化生成的 3D 城市生成器。使用本地 Three.js 做真实 3D 渲染，
 不依赖任何服务端 —— 打开网页即可生成城市。
 
