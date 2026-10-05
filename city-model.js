@@ -45,6 +45,79 @@ const CityModel = (() => {
     }
     return best;
   }
+  /* Roads, like the river, are a zone nothing may be built on. The centre-point
+     test above cannot enforce that on its own: a plot is a rotated square whose
+     corner reaches past the inscribed radius, and sampling the plot can miss a
+     road running through the middle of it entirely.
+     The exact answer comes from clipping each road segment to the plot, in the
+     plot's own frame, with Liang-Barsky. If any piece survives the clip the road
+     is inside the plot and the gap is negative; otherwise the nearest point is on
+     the boundary, so the clipped endpoints give the true distance. */
+  function rectRoadGap(plot, road) {
+    const hw = plot.w / 2, hd = plot.d / 2;
+    const c = Math.cos(plot.angle || 0), s = Math.sin(plot.angle || 0);
+    const ex = Math.abs(c) * hw + Math.abs(s) * hd;
+    const ez = Math.abs(s) * hw + Math.abs(c) * hd || .0001;
+    const path = road.path;
+    let best = Infinity;
+    for (let i = 1; i < path.length; i++) {
+      const ax = path[i-1].x, az = path[i-1].z, bx = path[i].x, bz = path[i].z;
+      // Cheap bounding-box rejection before the exact clip.
+      const lo_x = Math.min(ax, bx), hi_x = Math.max(ax, bx);
+      const lo_z = Math.min(az, bz), hi_z = Math.max(az, bz);
+      const ddx = lo_x > plot.x + ex ? lo_x - (plot.x + ex)
+                : (plot.x - ex > hi_x ? (plot.x - ex) - hi_x : 0);
+      const ddz = lo_z > plot.z + ez ? lo_z - (plot.z + ez)
+                : (plot.z - ez > hi_z ? (plot.z - ez) - hi_z : 0);
+      if (Math.sqrt(ddx * ddx + ddz * ddz) - road.w / 2 >= best) continue;
+      // Segment in plot-local coordinates.
+      const lx0 = (ax - plot.x) * c - (az - plot.z) * s;
+      const lz0 = (ax - plot.x) * s + (az - plot.z) * c;
+      const lx1 = (bx - plot.x) * c - (bz - plot.z) * s;
+      const lz1 = (bx - plot.x) * s + (bz - plot.z) * c;
+      const dx = lx1 - lx0, dz = lz1 - lz0;
+      let t0 = 0, t1 = 1, inside = true;
+      const P = [-dx, dx, -dz, dz];
+      const Q = [lx0 + hw, hw - lx0, lz0 + hd, hd - lz0];
+      for (let k = 0; k < 4; k++) {
+        if (P[k] === 0) { if (Q[k] < 0) { inside = false; break; } continue; }
+        const t = Q[k] / P[k];
+        if (P[k] < 0) { if (t > t1) { inside = false; break; } if (t > t0) t0 = t; }
+        else { if (t < t0) { inside = false; break; } if (t < t1) t1 = t; }
+      }
+      if (inside && t1 >= t0) {
+        // Part of the centreline lies within the plot: overlapping by definition.
+        const seg = Math.hypot(dx, dz) * Math.max(0, t1 - t0);
+        const d = Math.max(0, -seg);
+        if (d < best) best = d;
+        return -1;
+      }
+      // No overlap: the closest approach is a boundary point.
+      for (const [px, pz] of [[lx0, lz0], [lx1, lz1]]) {
+        const qx = clamp(px, -hw, hw), qz = clamp(pz, -hd, hd);
+        const d = Math.hypot(px - qx, pz - qz);
+        if (d < best) best = d;
+      }
+      for (const [qx, qz] of [[-hw,-hd],[hw,-hd],[hw,hd],[-hw,hd]]) {
+        const d = segmentPointDistance(qx, qz, lx0, lz0, lx1, lz1).d;
+        if (d < best) best = d;
+      }
+    }
+    return best - road.w / 2;
+  }
+  function roadFree(plot, roads, pad = 0) {
+    for (const r of roads) if (rectRoadGap(plot, r) < pad) return false;
+    return true;
+  }
+  /* A plot is a rectangle, not a point: comparing one axis at a time rejects
+     everything in a band even when the plot is nowhere near the structure. */
+  function structureFree(plot, structures, pad = 0) {
+    for (const s of structures) {
+      if (!overlaps(plot, {x: s.x, z: s.z, w: s.w, d: s.d, angle: s.angle || 0}, pad)) continue;
+      return false;
+    }
+    return true;
+  }
   function openWater(lakes, x, z, r) {
     return lakes.every(lake => !pointInLake(x, z, lake) && riverDistance(x, z, [...lake.points, lake.points[0]]) > r + .24);
   }
@@ -478,25 +551,11 @@ const CityModel = (() => {
         });
         lakeData.push({x, z, rx, rz, points});
       }
-      for (const [type, sign] of [['factory', -1], ['power', 1]]) {
-        const w = 2.35, d = 1.86, rad = Math.hypot(w, d) / 2;
-        /* The site must sit fully inside the city: `half - d/2 - margin` keeps the
-           gable from overhanging the perimeter wall. */
-        const inset = d / 2 + .10;
-        const siteX = Math.min(Math.abs(sign * (half - 1.5)), INNER - w / 2 - .10) * sign;
-        for (const zSign of [-1, 1]) {
-          const site = {type, x: siteX, z: zSign * (INNER - inset), w, d};
-          if (riverDistance(site.x, site.z, riverSamples) < channel + rad + .12) continue;
-          if (!lakeClear(site.x, site.z, rad, lakeData)) continue;
-          if (facilityData.some(b => overlaps(site, b, .25))) continue;
-          facilityData.push(site);
-          break;
-        }
-      }
     }
-    /* Roads first, then structures, then buildings. Order matters: the road set is
-       final (and connectivity-filtered) before crossings are searched, so an
-       overpass can never be left spanning a road that was later discarded. */
+    /* Roads first, then structures, then every kind of plot. Order matters: the
+       road set is final (and connectivity-filtered) before crossings are searched,
+       so an overpass can never be left spanning a road that was later discarded,
+       and facilities can be kept off the carriageway like any other plot. */
     const roads = buildRoadNetwork(rand, half, scale, riverSamples, bank, lakeData, facilityData);
     const bridgeData = placeBridges(roads, riverSamples, bank, lakeData, rand);
     /* Two kinds of structure share one list, distinguished by `type`:
@@ -509,6 +568,64 @@ const CityModel = (() => {
       if (x.skew < 28 || x.w < .62) continue;
       if (structureData.some(s => dist2(s.x, s.z, x.x, x.z) < .60 * .60)) continue;
       structureData.push({...x, lo: x.w / 2, d: .20});
+    }
+    if (diameter > 5) {
+      /* A 2.35 x 1.86 plant is a big footprint to fit around a ring road, a lake
+         and a river, and a fixed corner or a single edge often has nowhere left.
+         The whole city is scanned instead and the valid plot nearest the corner it
+         is meant to serve wins, which keeps the two plants in different quadrants
+         without ever failing to place them. */
+      /* Both plants want to sit near a corner, so scoring each one independently
+         lets the first take the plot the second needed. Every valid position is
+         collected once, then chosen greedily with each pick reserving its
+         neighbourhood, so the two settle in different parts of the city. */
+      const ex = INNER - 2.0, ez = INNER - 1.6;
+      const need = channel + Math.hypot(2.35, 1.86) / 2 + .12;
+      const collect = (step, roadPad) => {
+        const list = [];
+        /* Cheap rejections first: the river test is a handful of segment distance
+           calculations, whereas the road test samples the whole plot outline
+           against every road segment. */
+        for (let x = -ex; x <= ex; x += step) {
+          for (let z = -ez; z <= ez; z += step) {
+            if (Math.abs(x) + 1.25 > INNER - .09) continue;
+            if (Math.abs(z) + 1.0 > INNER - .09) continue;
+            if (riverDistance(x, z, riverSamples) < need) continue;
+            if (!lakeClear(x, z, 1.55, lakeData)) continue;
+            const site = {type: 'x', x, z, w: 2.35, d: 1.86, angle: 0};
+            if (!roadFree(site, roads, roadPad)) continue;
+            if (!structureFree(site, bridgeData, .10)) continue;
+            list.push(site);
+          }
+        }
+        return list;
+      };
+      const spot = (type, corner, list, pad) => {
+        const cx = corner[0] * half * .72, cz = corner[1] * half * .58;
+        let pick = null, pickD = Infinity;
+        for (const c of list) {
+          if (facilityData.some(b => overlaps(c, b, pad))) continue;
+          const d2 = dist2(c.x, c.z, cx, cz);
+          if (d2 < pickD) { pickD = d2; pick = c; }
+        }
+        if (pick) facilityData.push({type, x: pick.x, z: pick.z, w: pick.w, d: pick.d, angle: 0});
+        return !!pick;
+      };
+      /* Roads are a hard no-build zone; the clearance around them is only taste.
+         Stages run cheap-and-strict first and stop as soon as both plants are
+         seated, so a roomy layout never pays for a fine sweep. The last stage
+         still refuses any plot that touches the asphalt. */
+      const stages = [
+        [.16, .06, .30], [.16, .06, .02], [.11, .06, .02], [.11, 0, .02], [.07, 0, .02],
+      ];
+      for (const [step, roadPad, pad] of stages) {
+        const list = collect(step, roadPad);
+        const a = spot('factory', [-1, -1], list, pad);
+        const b = spot('power', [1, 1], list, pad);
+        if (a && b) break;
+        // Undo a partial attempt before relaxing and trying again.
+        facilityData.length = 0;
+      }
     }
     /* A radius test is too coarse here: the footprints are squares rotated to
        face the street, and a corner can reach well past the inscribed radius. The
@@ -526,7 +643,11 @@ const CityModel = (() => {
       if (Math.abs(x) + footprint.w / 2 > half - .12 || Math.abs(z) + footprint.d / 2 > half - .12) continue;
       if (riverDistance(x, z, riverSamples) < channel + radius + .025) continue;
       if (!lakeClear(x, z, radius, lakeData)) continue;
+      /* Roads are a no-build zone exactly like the river. The radius test below is
+         only a cheap pre-filter; the rotated-rectangle test is what actually
+         guarantees no plot corner reaches the carriageway. */
       if (roadClearance(x, z, roads) < radius) continue;
+      if (!roadFree(footprint, roads, .01)) continue;
       if (onBridge(footprint, .075)) continue;
       if (facilityData.some(b => overlaps(footprint, b, .12))) continue;
       if (buildingData.some(b => overlaps(footprint, b.footprint, .065))) continue;
