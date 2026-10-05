@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>星穹城境 · 3D 城市生成器</title>
+  <meta name="description" content="生成一个属于自己的 3D 城市">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <canvas id="space-canvas" aria-hidden="true"></canvas>
+  <div class="space-vignette" aria-hidden="true"></div>
+  <header class="topbar">
+    <a class="brand" href="#top" aria-label="星穹城境首页"><span class="brand-mark"><i></i><i></i><i></i></span><span><b>星穹城境</b><small>ASTRA CITY LAB</small></span></a>
+    <nav class="top-nav" aria-label="主导航"><a href="#generator">生成器</a><a href="#models">我的模型</a></nav>
+    <button class="login-trigger" id="login-trigger">登录 <span>↗</span></button>
+  </header>
+  <main id="top">
+    <section class="hero" id="generator">
+      <div class="hero-copy"><div class="eyebrow"><span class="live-dot"></span>ORBITAL CITY GENERATOR <span class="eyebrow-line"></span> V 1.0</div><h1>星穹<br><em>城境</em></h1><p class="hero-subtitle">生成一个属于自己的3d城市</p><p class="hero-desc">从 3 公里的城市核心，到 10 公里的未来都会，让高楼、湖泊与绿洲共同生长。</p><div class="hero-actions"><button class="primary-action" id="hero-generate">登录后生成城市 <span>↗</span></button><a class="ghost-action" href="#models">查看我的模型 <span>↓</span></a></div><div class="hero-facts"><span><b>3–10 KM</b><small>可选城市直径</small></span><span><b>∞</b><small>城市可能性</small></span><span><b>01</b><small>你的第一座城</small></span></div></div>
+
+    </section>
+    <section class="generator-panel panel-shell" aria-labelledby="generator-title"><div class="panel-head"><div><span class="panel-kicker">01 / GENERATOR</span><h2 id="generator-title">让城市开始生长</h2></div><span class="panel-status" id="generation-status">等待你的指令</span></div><div class="workbench"><div class="scene-wrap"><div id="city-scene" class="city-scene"><div class="scene-placeholder"><span class="scene-cross">+</span><p>登录后生成你的第一座城市</p><small>随机地形 · 随机天际线 · 随机边界</small></div></div><div class="scene-tools"><button id="view-reset" aria-label="重置视角">全景</button><button id="view-top" aria-label="俯瞰城市">俯瞰</button><button id="view-close" aria-label="近景视角">近景</button></div><div class="scene-guide">拖动旋转 · 滚轮缩放 · 右键拖动平移</div><div class="scene-hud"><span>ASTRA / CITY VIEW</span><span id="scene-seed">SEED ———</span></div></div><aside class="control-panel"><div class="control-label"><span>城市规格</span><span>RANDOMIZED</span></div><div class="diameter-control"><label for="city-diameter">城市直径 <output id="diameter-output" for="city-diameter">3 km</output></label><input id="city-diameter" type="range" min="3" max="10" step="1" value="3"><div class="range-labels"><span>3 km</span><span>5 km</span><span>10 km</span></div><p id="diameter-hint">紧凑城心 · 河流与街区公园</p></div><div class="spec-grid"><div><b id="city-size">3 KM</b><small>已生成直径</small></div><div><b id="building-count">—</b><small>建筑数量</small></div><div><b id="bridge-count">—</b><small>桥梁</small></div><div><b id="boundary-type">—</b><small>边界类型</small></div></div><div class="ecology-stats" id="ecology-stats">水系、绿地与产业随城市规模生长</div><div class="control-copy"><p>选择直径后生成。3–5 km 包含河流与公园；6–10 km 加入湖泊、工厂与发电站。每次生成都有新的天际线。</p></div><button class="generate-button" id="generate-button"><span class="button-icon">✦</span>生成随机城市 <span class="button-arrow">↗</span></button><button class="save-button" id="save-button" disabled><span>＋</span> 保存到我的模型</button><p class="login-hint" id="login-hint">登录后即可保存你生成的城市</p></aside></div></section>
+    <section class="models-section panel-shell" id="models" aria-labelledby="models-title"><div class="panel-head"><div><span class="panel-kicker">02 / MY MODELS</span><h2 id="models-title">我的城市模型</h2></div><span class="model-count" id="model-count">0 个已保存</span></div><div class="models-grid" id="models-grid"><div class="empty-model"><span>✦</span><p>你的城市档案会出现在这里</p><small>生成并保存一座城市，建立你的星穹版图</small></div></div></section>
+  </main>
+  <footer class="site-footer"><div><span class="footer-mark">SC</span><span>星穹城境 / ASTRA CITY LAB</span></div><span>BUILD WORLDS THAT FEEL LIKE HOME · 2026</span></footer>
+  <div class="modal-backdrop" id="login-modal" hidden><div class="login-modal" role="dialog" aria-modal="true" aria-labelledby="login-title"><button class="modal-close" id="modal-close" aria-label="关闭">×</button><span class="modal-kicker">WELCOME TO ASTRA</span><h2 id="login-title">登录你的城市实验室</h2><p>设置一个称呼，保存属于你的城市模型。</p><label for="display-name">你的称呼</label><input id="display-name" type="text" maxlength="18" placeholder="例如：星际建筑师" autocomplete="nickname"><button class="modal-submit" id="modal-submit">进入城市实验室 <span>↗</span></button><small>这是一个本地演示，信息只保存在当前设备。</small></div></div>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script defer src="vendor/three.global.min.js"></script>
+  <script defer src="city-model.js?v=4"></script>
+  <script defer src="app.js?v=4"></script>
+</body>
+</html>
