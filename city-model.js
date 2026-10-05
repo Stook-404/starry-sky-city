@@ -73,6 +73,43 @@ const CityModel = (() => {
     }
     return cur;
   }
+  /* Proper segment/segment crossing test, used to find where two roads meet so
+     the junction can be turned into a grade separation. */
+  function segmentsCross(ax, az, bx, bz, cx, cz, dx, dz) {
+    const r1 = bx - ax, r2 = bz - az, s1 = dx - cx, s2 = dz - cz;
+    const den = r1 * s2 - r2 * s1;
+    if (Math.abs(den) < 1e-12) return null;
+    const t = ((cx - ax) * s2 - (cz - az) * s1) / den;
+    const u = ((cx - ax) * r2 - (cz - az) * r1) / den;
+    if (t < 0 || t > 1 || u < 0 || u > 1) return null;
+    return {x: ax + r1 * t, z: az + r2 * t, angle: Math.atan2(r2, r1), crossAngle: Math.atan2(s2, s1)};
+  }
+  function roadCrossings(roads) {
+    const out = [];
+    for (let i = 0; i < roads.length; i++) for (let j = i + 1; j < roads.length; j++) {
+      const A = roads[i], B = roads[j];
+      for (let a = 1; a < A.path.length; a++) for (let b = 1; b < B.path.length; b++) {
+        const hit = segmentsCross(
+          A.path[a-1].x, A.path[a-1].z, A.path[a].x, A.path[a].z,
+          B.path[b-1].x, B.path[b-1].z, B.path[b].x, B.path[b].z);
+        if (!hit) continue;
+        let da = Math.abs(((hit.angle - hit.crossAngle) * 180 / Math.PI) % 180);
+        if (da > 90) da = 180 - da;
+        out.push({
+          x: hit.x, z: hit.z,
+          angle: hit.angle,
+          otherAngle: hit.crossAngle,
+          w: Math.max(A.w, B.w) * 2.6 + .30,
+          d: .20,
+          lane: A.w,
+          type: 3,
+          skew: da,
+          major: A.rank <= B.rank ? A.rank : B.rank,
+        });
+      }
+    }
+    return out;
+  }
   /* Where a road meets a body of water it becomes a bridge. The span only has to
      cover the water surface plus the abutments either side, because the road is
      already travelling perpendicular to the crossing. */
@@ -88,17 +125,6 @@ const CityModel = (() => {
       if (s < 0) lo = reach; else hi = reach;
     }
     return {lo, hi};
-  }
-  /* Several bridges facing the same crossing would give the same bank two arches
-     side by side, so each crossing is collapsed to a single representative. */
-  function clusterBridges(list, tol = .78) {
-    const kept = [];
-    for (const b of list) {
-      if (kept.some(k => k.type !== b.type && dist2(k.x, k.z, b.x, b.z) < tol * tol)) continue;
-      if (kept.some(k => dist2(k.x, k.z, b.x, b.z) < (tol * .45) ** 2)) continue;
-      kept.push(b);
-    }
-    return kept;
   }
   function corners(r, margin = 0) {
     const c = Math.cos(r.angle || 0), s = Math.sin(r.angle || 0);
@@ -129,88 +155,194 @@ const CityModel = (() => {
   function lakeClear(x,z,radius,lakes) {
     return lakes.every(lake => !pointInLake(x,z,lake) && riverDistance(x,z,[...lake.points,lake.points[0]])>radius+.24);
   }
-  /* The road network is grown before anything else is placed, so buildings can be
-     kept off the carriageway instead of the roads being drawn over them later. */
+  /* Several bridges facing the same crossing would give the same bank two arches
+     side by side, so each crossing is collapsed to a single representative. */
+  function clusterBridges(list, tol = .78) {
+    const kept = [];
+    for (const b of list) {
+      if (kept.some(k => k.type !== b.type && dist2(k.x, k.z, b.x, b.z) < tol * tol)) continue;
+      if (kept.some(k => dist2(k.x, k.z, b.x, b.z) < (tol * .45) ** 2)) continue;
+      kept.push(b);
+    }
+    return kept;
+  }
+  /* The road network is built before anything else is placed, so buildings can be
+     kept off the carriageway instead of the roads being drawn over them later.
+     Roads are also joined to the network as they are created: a street that stops
+     in mid-air is not a street, so each new route is extended until it meets an
+     existing one, and anything that still ends up isolated is discarded. */
   function buildRoadNetwork(rand, half, scale, riverSamples, bank, lakeData, facilityData) {
     const roads = [];
-    const edge = half - .28;
+    const edge = half - .42;
     const inCity = p => Math.abs(p.x) <= edge && Math.abs(p.z) <= edge;
     const clearOfLakes = (x, z, r) => lakeData.every(l => !inLakePolygon(x, z, l.points) &&
       riverDistance(x, z, [...l.points, l.points[0]]) > r);
     const clearOfFacilities = (x, z, r) => !facilityData.some(b => overlaps({x, z, w: r, d: r}, b, .04));
     const waterFree = (x, z, r) => riverDistance(x, z, riverSamples) > bank + r;
 
-    function push(pts, w, sw, rank) {
-      const path = smoothPath(pts.map(p => ({x: p.x, z: p.z})));
-      if (path.length > 1) roads.push({path, w, sw, rank});
+    /* Closest point on any existing road, with the local heading so a joining
+       street can be extended across the carriageway it meets. */
+    function nearestOnRoads(x, z) {
+      let best = null;
+      for (const r of roads) for (let i = 1; i < r.path.length; i++) {
+        const a = r.path[i-1], b = r.path[i];
+        const dx = b.x - a.x, dz = b.z - a.z, len2 = dx * dx + dz * dz;
+        const t = len2 ? clamp(((x - a.x) * dx + (z - a.z) * dz) / len2, 0, 1) : 0;
+        const px = a.x + dx * t, pz = a.z + dz * t;
+        const d = Math.hypot(x - px, z - pz);
+        if (!best || d < best.d) best = {d, x: px, z: pz, ang: Math.atan2(dz, dx), w: r.w, road: r, idx: i};
+      }
+      return best;
+    }
+    /* Extend an open end out to the road it comes near, a little past the
+       centreline, so the two carriageways genuinely overlap. */
+    function joinEnd(path, end, reach) {
+      const p = end === 0 ? path[0] : path[path.length - 1];
+      const q = end === 0 ? path[1] : path[path.length - 2];
+      const near = nearestOnRoads(p.x, p.z);
+      if (!near || near.d > reach) return false;
+      const len = Math.hypot(p.x - q.x, p.z - q.z) || 1;
+      const ux = (p.x - q.x) / len, uz = (p.z - q.z) / len;
+      const over = near.w * .35 + .02;
+      const nx = near.x + ux * over, nz = near.z + uz * over;
+      if (Math.hypot(nx - p.x, nz - p.z) > .001) {
+        if (end === 0) path.unshift({x: nx, z: nz});
+        else path.push({x: nx, z: nz});
+      }
+      return true;
+    }
+    /* Force a route onto the network. Growing outward from the ends works for an
+       open street, but a closed ring has no usable endpoint direction, so the
+       nearest point on the ring is spliced to the nearest road instead. That makes
+       connectivity a property of construction rather than something to hope for. */
+    function connectToNetwork(path) {
+      if (!roads.length) return true;
+      if (joinEnd(path, 0, 1.5) || joinEnd(path, 1, 1.5)) return true;
+      // Closed or stubborn route: splice a lead-in at its closest approach.
+      let best = null;
+      for (let i = 0; i < path.length; i++) {
+        const n = nearestOnRoads(path[i].x, path[i].z);
+        if (n && (!best || n.d < best.n.d)) best = {i, n};
+      }
+      if (!best) return false;
+      const target = {x: best.n.x, z: best.n.z};
+      const at = path[best.i];
+      const insert = (arr, pt) => arr.splice(best.i, 0, pt);
+      // Ring: duplicate the join vertex so the loop stays closed and gains a stub.
+      if (path.length > 2 && dist2(path[0].x, path[0].z, path[path.length-1].x, path[path.length-1].z) < .01) {
+        insert(path, {...target});
+        insert(path, {...at});
+      } else {
+        insert(path, {...target});
+      }
+      return true;
+    }
+    function push(pts, w, sw, rank, opts = {}) {
+      let path = smoothPath(pts.map(p => ({x: p.x, z: p.z})));
+      if (path.length < 2) return false;
+      if (roads.length && !opts.allowLoose) {
+        if (!connectToNetwork(path)) return false;
+      } else if (roads.length) {
+        connectToNetwork(path);
+      }
+      roads.push({path, w, sw, rank});
+      return true;
+    }
+    /* Where a route is anchored to an existing road, extend a stub perpendicular
+       to it so the junction is a T rather than a hairline touch. */
+    function tJunction(x, z, ang, w, rank) {
+      const off = .34;
+      const nx = Math.sin(ang), nz = Math.cos(ang);
+      const a = {x: x - nx * off, z: z - nz * off};
+      const b = {x: x + nx * off, z: z + nz * off};
+      if (!inCity(a) || !inCity(b)) return;
+      push([a, b], w, .012, rank, {reach: .30});
     }
 
-    /* Spine: walks the length of the city, bending by a slowly varying heading so
-       the result reads as a planned arterial rather than a straight grid line. */
-    function spine(offset, w, sw, rank) {
-      const n = 9, pts = [];
-      let heading = (rand() - .5) * .9, x = -edge;
+    /* Spine: a gently meandering arterial. A random walk was tried first but its
+       heading accumulates, which drives the road into the city edge and leaves the
+       ring roads with nothing to attach to. Oscillating around the centre keeps it
+       organic while guaranteeing it stays reachable across the full depth. */
+    const spinePath = [];
+    const spinePhase = rand() * 6.28;
+    const spineAmp = Math.min(half * .22, (edge - half * .1) * .45);
+    const spineBend = 1.1 + rand() * .9;
+    (function spine() {
+      const n = 9;
       for (let i = 0; i <= n; i++) {
         const t = i / n;
-        heading += (rand() - .5) * .42;
-        heading = clamp(heading, -.8, .8);
         const z = -edge + t * edge * 2;
-        x = clamp(x + Math.tan(heading) * (edge * 2 / n) + offset * .12, -edge, edge);
-        pts.push({x, z});
+        const x = clamp(
+          Math.sin(t * spineBend + spinePhase) * spineAmp +
+          Math.sin(t * 2.6 + spinePhase * 1.7) * spineAmp * .28,
+          -edge * .8, edge * .8);
+        spinePath.push({x, z});
       }
-      push(pts, w, sw, rank);
-    }
-    spine(0, .17, .026, 0);
-    if (scale > 1.2) spine(1, .145, .021, 1);
+      push(spinePath, .17, .026, 0, {allowLoose: true, jointStart: false, jointEnd: false});
+    })();
 
-    /* Loop: a ring road around the core, wobbled so it is never a perfect
-       rectangle. Two of them appear on the larger layouts. */
-    function loop(radius, w, sw, rank) {
+    /* Loop: a ring road around a point on the spine, then tied back to the spine
+       with two connecting streets so the ring is actually reachable. */
+    function loop(centreT, radius, w, sw, rank) {
+      const idx = clamp(Math.round(centreT * (spinePath.length - 1)), 0, spinePath.length - 1);
+      const c = spinePath[idx];
       const n = 13, pts = [];
       for (let i = 0; i <= n; i++) {
         const a = (i / n) * Math.PI * 2;
         const r = radius * (1 + (rand() - .5) * .17);
         pts.push({
-          x: Math.cos(a) * r * (1 + (rand() - .5) * .06),
-          z: Math.sin(a) * r * .86 * (1 + (rand() - .5) * .06),
+          x: clamp(c.x + Math.cos(a) * r * (1 + (rand() - .5) * .06), -edge, edge),
+          z: clamp(c.z + Math.sin(a) * r * .86 * (1 + (rand() - .5) * .06), -edge, edge),
         });
       }
-      push(pts, w, sw, rank);
+      if (!push(pts, w, sw, rank)) return;
+      // Two stubs tie the ring to the arterial that spawned it.
+      for (const side of [-1, 1]) {
+        const ang = Math.atan2(c.z - (c.z + side * radius), c.x - (c.x + side * radius));
+        tJunction(c.x, c.z + side * radius * .86, ang, .1, rank + 1);
+      }
     }
-    loop(half * .58, .12, .018, 2);
-    if (scale > 1.25) loop(half * .82, .105, .016, 2);
+    loop(.34, half * .52, .12, .018, 2);
+    if (scale > 1.25) loop(.72, half * .56, .105, .016, 2);
 
-    /* Perimeter ring road at the edge of the built-up area. */
+    /* Perimeter ring road at the edge of the built-up area, joined to the spine
+       at four points so it forms a connected circuit rather than a lone box. */
     (function perimeter() {
       const pts = [];
       for (const [sx, sz] of [[-1,-1],[1,-1],[1,1],[-1,1],[-1,-1]]) {
-        pts.push({x: sx * (half - .42), z: sz * (half - .42)});
+        pts.push({x: sx * (half - .58), z: sz * (half - .58)});
       }
       push(pts, .1, .015, 3);
     })();
 
-    /* Cross lanes: short local streets laid roughly across the spine. They give
-       the blocks a direction without ever forming a lattice. */
-    const laneCount = clamp(Math.round(half * 1.5), 4, 15);
-    for (let i = 0; i < laneCount * 5 && roads.length < laneCount + 8; i++) {
+    /* Cross lanes: local streets starting from a point on the network and running
+       outward. Each one is pulled onto the network as it is created, so a lane
+       either joins properly or is rejected outright. */
+    const laneTarget = clamp(Math.round(half * 1.6), 5, 18);
+    let lanes = 0;
+    for (let i = 0; i < laneTarget * 6 && lanes < laneTarget; i++) {
+      const src = roads[Math.floor(rand() * roads.length)];
+      if (!src) break;
+      const si = 1 + Math.floor(rand() * (src.path.length - 1));
+      const anchor = src.path[si];
       const a = rand() * Math.PI * 2;
-      const len = half * (.28 + rand() * .5);
-      const cx = (rand() - .5) * half * 1.5, cz = (rand() - .5) * half * 1.5;
+      const len = half * (.30 + rand() * .55);
       const dx = Math.cos(a), dz = Math.sin(a);
-      const curve = (rand() - .5) * .35;
+      const curve = (rand() - .5) * .38;
       const pts = [
-        {x: cx - dx * len, z: cz - dz * len},
-        {x: cx + dz * curve, z: cz - dx * curve},
-        {x: cx + dx * len, z: cz + dz * len},
+        {x: anchor.x, z: anchor.z},
+        {x: anchor.x + dx * len * .5 + dz * curve, z: anchor.z + dz * len * .5 - dx * curve},
+        {x: anchor.x + dx * len, z: anchor.z + dz * len},
       ];
-      if (!pts.every(inCity)) continue;
+      if (!inCity(pts[2])) continue;
       if (!clearOfLakes(pts[1].x, pts[1].z, .34)) continue;
       if (!clearOfFacilities(pts[1].x, pts[1].z, .42)) continue;
-      push(pts, .095, .014, 4);
+      if (push(pts, .095, .014, 4)) lanes++;
     }
 
-    /* Grade separation: roads that have nothing to do with the water are kept
-       clear of the far bank so they never read as crossing the river. */
+    /* Roads that have nothing to do with the water are kept clear of the far bank
+       so they never read as crossing the river, and any that ends up sharing no
+       junction with the rest of the network is discarded. */
     const usable = [];
     for (const r of roads) {
       if (r.rank > 2) {
@@ -222,7 +354,39 @@ const CityModel = (() => {
       }
       usable.push(r);
     }
-    return usable;
+    // Connectivity filter: keep only roads reachable from the arterial. This has
+    // to measure segment-to-segment, not vertex-to-vertex: a ring road's vertices
+    // can sit far from the arterial's while the two still cross.
+    const segmentGap = (a, b) => {
+      let best = Infinity;
+      for (let i = 1; i < a.path.length; i++) for (let j = 1; j < b.path.length; j++) {
+        const p = a.path[i-1], q = a.path[i], r = b.path[j-1], s = b.path[j];
+        const d = Math.min(
+          segmentPointDistance(p.x, p.z, r.x, r.z, s.x, s.z).d,
+          segmentPointDistance(q.x, q.z, r.x, r.z, s.x, s.z).d,
+          segmentPointDistance(r.x, r.z, p.x, p.z, q.x, q.z).d,
+          segmentPointDistance(s.x, s.z, p.x, p.z, q.x, q.z).d);
+        if (d < best) best = d;
+      }
+      return best;
+    };
+    const adjacency = (a, b) => segmentGap(a, b) < .40;
+    const keep = new Set();
+    const byRank = [...usable].sort((x, y) => x.rank - y.rank);
+    if (byRank.length) {
+      keep.add(byRank[0]);
+      let grew = true;
+      while (grew) {
+        grew = false;
+        for (const r of byRank) {
+          if (keep.has(r)) continue;
+          for (const k of keep) {
+            if (adjacency(r, k)) { keep.add(r); grew = true; break; }
+          }
+        }
+      }
+    }
+    return byRank.filter(r => keep.has(r));
   }
   /* Every point where the network meets the river becomes a bridge. The bridge
      records the water span in its local frame so the deck can be drawn exactly
@@ -276,20 +440,32 @@ const CityModel = (() => {
   }
   function generate(seed, diameter = 3) {
     diameter = clamp(Math.round(Number(diameter) || 3), 3, 10);
-    const half = diameter, scale = diameter / 3, extent = half + .85;
+    const half = diameter, scale = diameter / 3;
+    /* Everything the generator places has to fit inside the city. The perimeter
+       wall sits just outside `half`, so water, roads and plots are all kept in by
+       a margin rather than being allowed to spill into the surround. */
+    const INNER = half - .12;
+    const riverExtent = INNER;
     const rand = random(seed);
-    const phase = rand() * 6.28, amplitude = (.52 + rand() * .46) * scale, bend = (.06 + rand() * .18) * scale;
-    const samples = Math.ceil(extent * 48);
-    const riverSamples = Array.from({length: samples + 1}, (_, i) => {
-      const z = -extent + i * extent * 2 / samples;
-      return {x: Math.sin(z * .7 / scale + phase) * amplitude + Math.sin(z * 1.7 / scale + phase) * bend, z};
-    });
     /* Channel width is drawn per seed: some cities get a narrow canal with tight
        banks, others a broad river with long embankments. All river, bridge and
-       promenade geometry is derived from `bank`, so the two stay consistent. */
+       promenade geometry derives from `bank`, so the parts stay consistent. It is
+       drawn before the meander so the amplitude can be budgeted against the room
+       the channel actually has. */
     const bankVar = rand();
     const bank = BANK * (.62 + bankVar * .95);      // 0.62x .. 1.57x of the default
     const channel = bank + WATER;
+    const phase = rand() * 6.28;
+    /* The meander amplitude is capped against the space actually available, so the
+       channel always stays inside the city instead of wandering past the wall. */
+    const lateral = clamp(INNER - channel - .30, .35, 4.2);
+    const amplitude = Math.min((.52 + rand() * .46) * scale, lateral * .78);
+    const bend = Math.min((.06 + rand() * .18) * scale, lateral * .22);
+    const samples = Math.ceil(riverExtent * 48);
+    const riverSamples = Array.from({length: samples + 1}, (_, i) => {
+      const z = -riverExtent + i * riverExtent * 2 / samples;
+      return {x: Math.sin(z * .7 / scale + phase) * amplitude + Math.sin(z * 1.7 / scale + phase) * bend, z};
+    });
     const lakeData = [], facilityData = [];
     if (diameter > 5) {
       const count = diameter >= 8 ? 2 : 1;
@@ -303,27 +479,42 @@ const CityModel = (() => {
         lakeData.push({x, z, rx, rz, points});
       }
       for (const [type, sign] of [['factory', -1], ['power', 1]]) {
-        const w = 2.35, d = 1.86;
+        const w = 2.35, d = 1.86, rad = Math.hypot(w, d) / 2;
+        /* The site must sit fully inside the city: `half - d/2 - margin` keeps the
+           gable from overhanging the perimeter wall. */
+        const inset = d / 2 + .10;
+        const siteX = Math.min(Math.abs(sign * (half - 1.5)), INNER - w / 2 - .10) * sign;
         for (const zSign of [-1, 1]) {
-          const site = {type, x: sign * (half - 1.5), z: zSign * (half - 1.35), w, d};
-          if (riverDistance(site.x, site.z, riverSamples) < channel + Math.hypot(w, d) / 2 + .12) continue;
-          if (!lakeClear(site.x, site.z, Math.hypot(w, d) / 2, lakeData)) continue;
+          const site = {type, x: siteX, z: zSign * (INNER - inset), w, d};
+          if (riverDistance(site.x, site.z, riverSamples) < channel + rad + .12) continue;
+          if (!lakeClear(site.x, site.z, rad, lakeData)) continue;
           if (facilityData.some(b => overlaps(site, b, .25))) continue;
           facilityData.push(site);
           break;
         }
       }
     }
-    /* Roads first, bridges from the road/water crossings, buildings last. That
-       order is what keeps carriageways free of towers and guarantees that every
-       bridge sits on a road that actually reaches it. */
+    /* Roads first, then structures, then buildings. Order matters: the road set is
+       final (and connectivity-filtered) before crossings are searched, so an
+       overpass can never be left spanning a road that was later discarded. */
     const roads = buildRoadNetwork(rand, half, scale, riverSamples, bank, lakeData, facilityData);
     const bridgeData = placeBridges(roads, riverSamples, bank, lakeData, rand);
+    /* Two kinds of structure share one list, distinguished by `type`:
+         type 0/1/2 - river bridges (arch / cable-stayed / girder) that carry a
+                      road over the water and ramp back down onto the bank roads;
+         type 3     - overpasses that carry one road over another where the two
+                      networks cross, ramping down onto the road beneath. */
+    const structureData = [...bridgeData];
+    for (const x of roadCrossings(roads)) {
+      if (x.skew < 28 || x.w < .62) continue;
+      if (structureData.some(s => dist2(s.x, s.z, x.x, x.z) < .60 * .60)) continue;
+      structureData.push({...x, lo: x.w / 2, d: .20});
+    }
     /* A radius test is too coarse here: the footprints are squares rotated to
        face the street, and a corner can reach well past the inscribed radius. The
        exact rotated-rectangle test is used so no plot grows over a deck. */
     const onBridge = (footprint, pad) =>
-      bridgeData.some(b => overlaps(footprint, {x: b.x, z: b.z, w: b.w, d: b.d, angle: b.angle}, pad));
+      structureData.some(b => overlaps(footprint, {x: b.x, z: b.z, w: b.w, d: b.d, angle: b.angle}, pad));
 
     const buildingData = [], parkData = [];
     const attempts = 2600;
@@ -349,9 +540,11 @@ const CityModel = (() => {
       buildingData.push({x, z, w, d, h, footprint, style: Math.floor(rand() * 4), palette: Math.floor(rand() * 4), detailSeed: Math.floor(rand() * 0xffffffff)});
     }
     if (!parkData.length && buildingData.length > 1) parkData.push(buildingData.pop().footprint);
-    return {seed, diameter, half, riverSamples, bank, channel, roads, bridgeData, buildingData, parkData, lakeData, facilityData,
+    return {seed, diameter, half, INNER, riverSamples, bank, channel, roads, bridgeData, structureData,
+      buildingData, parkData, lakeData, facilityData,
       buildings: buildingData.length, bridges: bridgeData.length,
-      boundary: ['城墙', '河岸', '高山'][Math.floor(rand() * 3)], version: 5};
+      overpasses: structureData.filter(s => s.type === 3).length,
+      boundary: ['城墙', '河岸', '高山'][Math.floor(rand() * 3)], version: 6};
   }
   function tiers(b) {
     const base = .116;
@@ -576,9 +769,13 @@ const CityModel = (() => {
      and a narrow one gets a short bridge. Approaches reach the bank road at
      y=.013, matching the carriageway height. */
   function bridge(batch,b) {
+    const isOverpass=b.type===3;
     const lo=Math.max(b.lo,.26), hi=Math.max(b.w-b.lo,.26);
-    const d=b.d, half=d/2, lane=b.lane||.12;
-    const deckY=.098;
+    const d=b.d, half=d/2;
+    // Overpasses ride higher so the road below passes cleanly underneath, and
+    // their approach ramps are longer to keep the same gentle grade.
+    const deckY=isOverpass?.152:.098;
+    const ramp=isOverpass?.72:.34;
     batch.at(b.x,b.z,b.angle);
     batch.box(lo+hi,deckY,d,0,deckY/2,0,'concreteDark');
     batch.box(lo+hi,.008,d-.05,0,deckY+.004,0,'asphalt');
@@ -590,7 +787,14 @@ const CityModel = (() => {
     };
     rail(half-.011); rail(-(half-.011));
 
-    if(b.type===0) {
+    if(isOverpass) {
+      // Grade separation: abutment walls, a pair of piers and a light parapet.
+      for(const end of [-1,1]) batch.box(.10,deckY,d*.92,end*(lo-.05),deckY/2,0,'concrete');
+      for(const side of [-1,1]) {
+        batch.box(.055,deckY,d*.30,-lo*.30,deckY/2,side*(half-.05),'concrete');
+        batch.box(.055,deckY,d*.30, hi*.30,deckY/2,side*(half-.05),'concrete');
+      }
+    } else if(b.type===0) {
       // Twin arches: short spans get one, long spans get two supports in the river.
       const arches=lo+hi>1.35?2:1;
       for(let k=0;k<arches;k++){
@@ -627,8 +831,10 @@ const CityModel = (() => {
       for(const x of [-lo*.55,hi*.55]) batch.box(.075,.085,d,x,deckY/2,0,'concrete');
     }
 
+    /* Approach ramps on both ends, so the deck meets the ground carriageway
+       instead of stopping in mid air. */
     for(const end of [-1,1]) {
-      const x0=end*lo, x1=end*(lo+.34);
+      const x0=end*lo, x1=end*(lo+ramp);
       batch.quad(end>0
         ? [[x0,deckY+.004,-half],[x0,deckY+.004,half],[x1,.013,half],[x1,.013,-half]]
         : [[x1,.013,-half],[x1,.013,half],[x0,deckY+.004,half],[x0,deckY+.004,-half]],'asphalt');
@@ -636,15 +842,17 @@ const CityModel = (() => {
         const q=[[x0,.007,edge*half],[x0,deckY+.004,edge*half],[x1,.013,edge*half],[x1,.007,edge*half]];
         batch.quad((end*edge)>0?q:q.slice().reverse(),'concreteDark');
       }
-      batch.box(.07,.092,quarter(d),end*(lo+.06),.046,half-.075,'concrete');
-      batch.box(.07,.092,quarter(d),end*(lo+.06),.046,-(half-.075),'concrete');
+      if(!isOverpass) {
+        batch.box(.07,.092,quarter(d),end*(lo+.06),.046,half-.075,'concrete');
+        batch.box(.07,.092,quarter(d),end*(lo+.06),.046,-(half-.075),'concrete');
+      }
     }
     function quarter(dd){ return Math.min(.05,dd*.22); }
     for(let x=-lo+.06;x<hi;x+=.14) batch.box(.055,.002,.005,x,deckY+.009,0,'marking');
     batch.at(0,0);
   }
   function roadAndLandscape(batch,layout) {
-    const roads=layout.roads, bridges=layout.bridgeData;
+    const roads=layout.roads, bridges=layout.structureData;
     const rand=random(layout.seed+19);
     // Passing under a bridge would put tarmac through the deck, so the
     // carriageway is suppressed inside a bridge's footprint.
@@ -875,7 +1083,7 @@ const CityModel = (() => {
     roadAndLandscape(batch,layout);river(batch,layout);
     for(const lake of layout.lakeData) addLake(batch,lake);
     for(const site of layout.facilityData) facility(batch,site);
-    for(const b of layout.bridgeData) bridge(batch,b);
+    for(const b of layout.structureData) bridge(batch,b);
     for(const b of layout.buildingData) tower(batch,b);
     boundary(batch,layout);batch.finish(group);
     return group;
