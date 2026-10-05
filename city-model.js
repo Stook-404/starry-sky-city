@@ -1,7 +1,8 @@
 /* Shared planning and geometry: all buildings, bridge approaches and banks use
    the same world coordinates. No transparent facades or screen-space outlines. */
 const CityModel = (() => {
-  const BANK = .34;
+  const BANK = .34;        // default bank margin; each layout may override it
+  const WATER = .255;      // half-width of the water surface itself
   const FLOOR = .074;
   const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
   function random(seed) {
@@ -17,6 +18,87 @@ const CityModel = (() => {
     let d = Infinity;
     for (let i = 1; i < points.length; i++) d = Math.min(d, segmentDistance(x, z, points[i - 1], points[i]));
     return d;
+  }
+  function dist2(ax, az, bx, bz) { const dx = ax - bx, dz = az - bz; return dx * dx + dz * dz; }
+  /* Point-to-segment distance for plain coordinates, with the parameter `t` of
+     the closest point so callers can interpolate along the segment. */
+  function segmentPointDistance(x, z, ax, az, bx, bz) {
+    const dx = bx - ax, dz = bz - az, len2 = dx * dx + dz * dz;
+    const t = len2 ? clamp(((x - ax) * dx + (z - az) * dz) / len2, 0, 1) : 0;
+    return {d: Math.hypot(x - ax - dx * t, z - az - dz * t), t};
+  }
+  function segmentDistance2(x, z, road) {
+    let best = Infinity;
+    for (let i = 1; i < road.path.length; i++) {
+      const {d} = segmentPointDistance(x, z, road.path[i-1].x, road.path[i-1].z, road.path[i].x, road.path[i].z);
+      if (d < best) best = d;
+    }
+    return best;
+  }
+  /* Roads have real width, so plots must clear half the carriageway plus the
+     sidewalk before a building may be placed. */
+  function roadClearance(x, z, roads, pad = 0) {
+    let best = Infinity;
+    for (const r of roads) {
+      const m = segmentDistance2(x, z, r) - (r.w / 2 + r.sw + .035) - pad;
+      if (m < best) best = m;
+    }
+    return best;
+  }
+  function openWater(lakes, x, z, r) {
+    return lakes.every(lake => !pointInLake(x, z, lake) && riverDistance(x, z, [...lake.points, lake.points[0]]) > r + .24);
+  }
+  function inLakePolygon(x, z, points) {
+    let inside = false;
+    for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
+      const a = points[i], b = points[j];
+      if ((a.z > z) !== (b.z > z) && x < (b.x - a.x) * (z - a.z) / (b.z - a.z) + a.x) inside = !inside;
+    }
+    return inside;
+  }
+  /* Chaikin corner cutting: one pass removes the sharp elbows that a random walk
+     leaves behind, so roads read as surveyed routes rather than jitter. */
+  function smoothPath(path, passes = 2) {
+    let cur = path;
+    for (let k = 0; k < passes; k++) {
+      if (cur.length < 3) break;
+      const next = [cur[0]];
+      for (let i = 0; i < cur.length - 1; i++) {
+        const a = cur[i], b = cur[i + 1];
+        next.push({x: a.x * .75 + b.x * .25, z: a.z * .75 + b.z * .25});
+        next.push({x: a.x * .25 + b.x * .75, z: a.z * .25 + b.z * .75});
+      }
+      next.push(cur[cur.length - 1]);
+      cur = next;
+    }
+    return cur;
+  }
+  /* Where a road meets a body of water it becomes a bridge. The span only has to
+     cover the water surface plus the abutments either side, because the road is
+     already travelling perpendicular to the crossing. */
+  function crossingSpan(p, dir, samples, water) {
+    let lo = 0, hi = 0;
+    for (const s of [-1, 1]) {
+      let reach = water;
+      for (let d = water; d <= water + 1.5; d += .04) {
+        const q = riverDistance(p.x + dir.x * d * s, p.z + dir.z * d * s, samples);
+        if (q <= water + .02) reach = d;
+        else if (d > reach + .12) break;
+      }
+      if (s < 0) lo = reach; else hi = reach;
+    }
+    return {lo, hi};
+  }
+  /* Several bridges facing the same crossing would give the same bank two arches
+     side by side, so each crossing is collapsed to a single representative. */
+  function clusterBridges(list, tol = .78) {
+    const kept = [];
+    for (const b of list) {
+      if (kept.some(k => k.type !== b.type && dist2(k.x, k.z, b.x, b.z) < tol * tol)) continue;
+      if (kept.some(k => dist2(k.x, k.z, b.x, b.z) < (tol * .45) ** 2)) continue;
+      kept.push(b);
+    }
+    return kept;
   }
   function corners(r, margin = 0) {
     const c = Math.cos(r.angle || 0), s = Math.sin(r.angle || 0);
@@ -47,69 +129,229 @@ const CityModel = (() => {
   function lakeClear(x,z,radius,lakes) {
     return lakes.every(lake => !pointInLake(x,z,lake) && riverDistance(x,z,[...lake.points,lake.points[0]])>radius+.24);
   }
-  function generate(seed,diameter=3) {
-    diameter=clamp(Math.round(Number(diameter)||3),3,10);
-    const half=diameter, scale=diameter/3, extent=half+.85;
-    const cellCount=Math.floor((half*2-.4)/.7), step=(half*2-.4)/cellCount;
-    const grid=Array.from({length:cellCount+1},(_,i)=>-half+.2+i*step);
-    const rand = random(seed);
-    const phase = rand() * 6.28, amplitude = (.52 + rand() * .46)*scale, bend = (.06 + rand() * .18)*scale;
-    const samples=Math.ceil(extent*48);
-    const riverSamples = Array.from({length:samples+1}, (_,i) => {
-      const z = -extent + i * extent*2 / samples;
-      return {x: Math.sin(z * .7/scale + phase) * amplitude + Math.sin(z * 1.7/scale + phase) * bend, z};
-    });
-    const bridgeCount=clamp(Math.round(diameter*1.2),4,9);
-    let bridgeData = Array.from({length:bridgeCount},(_,i)=> (-half+.9)+i*(half*2-1.8)/(bridgeCount-1)).map(z => {
-      const i = riverSamples.reduce((best,p,j) => Math.abs(p.z-z) < Math.abs(riverSamples[best].z-z) ? j : best, 1);
-      const p = riverSamples[i], a = riverSamples[i-1], b = riverSamples[i+1];
-      // THREE's Y rotation maps local +X onto the river's perpendicular.
-      return { x:p.x, z:p.z, angle: Math.atan2(b.x-a.x,b.z-a.z), w:1.74, d:.22 };
-    });
-    const lakeData=[],facilityData=[];
-    if(diameter>5) {
-      const count=diameter>=8?2:1;
-      for(let i=0;i<count;i++) {
-        const sign=i===0?-1:1, x=sign*half*.61, z=(i===0?1:-1)*half*.37;
-        const rx=.76+diameter*.052+rand()*.15, rz=.67+diameter*.065+rand()*.13, phase=rand()*6.28;
-        const points=Array.from({length:64},(_,j)=>{
-          const angle=j*Math.PI/32,r=1+.10*Math.sin(angle*3+phase)+.06*Math.cos(angle*5-phase);
-          return {x:x+Math.cos(angle)*rx*r,z:z+Math.sin(angle)*rz*r};
-        });
-        lakeData.push({x,z,rx,rz,points});
+  /* The road network is grown before anything else is placed, so buildings can be
+     kept off the carriageway instead of the roads being drawn over them later. */
+  function buildRoadNetwork(rand, half, scale, riverSamples, bank, lakeData, facilityData) {
+    const roads = [];
+    const edge = half - .28;
+    const inCity = p => Math.abs(p.x) <= edge && Math.abs(p.z) <= edge;
+    const clearOfLakes = (x, z, r) => lakeData.every(l => !inLakePolygon(x, z, l.points) &&
+      riverDistance(x, z, [...l.points, l.points[0]]) > r);
+    const clearOfFacilities = (x, z, r) => !facilityData.some(b => overlaps({x, z, w: r, d: r}, b, .04));
+    const waterFree = (x, z, r) => riverDistance(x, z, riverSamples) > bank + r;
+
+    function push(pts, w, sw, rank) {
+      const path = smoothPath(pts.map(p => ({x: p.x, z: p.z})));
+      if (path.length > 1) roads.push({path, w, sw, rank});
+    }
+
+    /* Spine: walks the length of the city, bending by a slowly varying heading so
+       the result reads as a planned arterial rather than a straight grid line. */
+    function spine(offset, w, sw, rank) {
+      const n = 9, pts = [];
+      let heading = (rand() - .5) * .9, x = -edge;
+      for (let i = 0; i <= n; i++) {
+        const t = i / n;
+        heading += (rand() - .5) * .42;
+        heading = clamp(heading, -.8, .8);
+        const z = -edge + t * edge * 2;
+        x = clamp(x + Math.tan(heading) * (edge * 2 / n) + offset * .12, -edge, edge);
+        pts.push({x, z});
       }
-      for(const [type,sign] of [['factory',-1],['power',1]]) {
-        const w=2.35,d=1.86;
-        for(const zSign of [-1,1]) {
-          const site={type,x:sign*(half-1.5),z:zSign*(half-1.35),w,d};
-          if(riverDistance(site.x,site.z,riverSamples)<BANK+Math.hypot(w,d)/2+.12) continue;
-          if(!lakeClear(site.x,site.z,Math.hypot(w,d)/2,lakeData)) continue;
-          if(facilityData.some(b=>overlaps(site,b,.25))) continue;
-          facilityData.push(site);break;
+      push(pts, w, sw, rank);
+    }
+    spine(0, .17, .026, 0);
+    if (scale > 1.2) spine(1, .145, .021, 1);
+
+    /* Loop: a ring road around the core, wobbled so it is never a perfect
+       rectangle. Two of them appear on the larger layouts. */
+    function loop(radius, w, sw, rank) {
+      const n = 13, pts = [];
+      for (let i = 0; i <= n; i++) {
+        const a = (i / n) * Math.PI * 2;
+        const r = radius * (1 + (rand() - .5) * .17);
+        pts.push({
+          x: Math.cos(a) * r * (1 + (rand() - .5) * .06),
+          z: Math.sin(a) * r * .86 * (1 + (rand() - .5) * .06),
+        });
+      }
+      push(pts, w, sw, rank);
+    }
+    loop(half * .58, .12, .018, 2);
+    if (scale > 1.25) loop(half * .82, .105, .016, 2);
+
+    /* Perimeter ring road at the edge of the built-up area. */
+    (function perimeter() {
+      const pts = [];
+      for (const [sx, sz] of [[-1,-1],[1,-1],[1,1],[-1,1],[-1,-1]]) {
+        pts.push({x: sx * (half - .42), z: sz * (half - .42)});
+      }
+      push(pts, .1, .015, 3);
+    })();
+
+    /* Cross lanes: short local streets laid roughly across the spine. They give
+       the blocks a direction without ever forming a lattice. */
+    const laneCount = clamp(Math.round(half * 1.5), 4, 15);
+    for (let i = 0; i < laneCount * 5 && roads.length < laneCount + 8; i++) {
+      const a = rand() * Math.PI * 2;
+      const len = half * (.28 + rand() * .5);
+      const cx = (rand() - .5) * half * 1.5, cz = (rand() - .5) * half * 1.5;
+      const dx = Math.cos(a), dz = Math.sin(a);
+      const curve = (rand() - .5) * .35;
+      const pts = [
+        {x: cx - dx * len, z: cz - dz * len},
+        {x: cx + dz * curve, z: cz - dx * curve},
+        {x: cx + dx * len, z: cz + dz * len},
+      ];
+      if (!pts.every(inCity)) continue;
+      if (!clearOfLakes(pts[1].x, pts[1].z, .34)) continue;
+      if (!clearOfFacilities(pts[1].x, pts[1].z, .42)) continue;
+      push(pts, .095, .014, 4);
+    }
+
+    /* Grade separation: roads that have nothing to do with the water are kept
+       clear of the far bank so they never read as crossing the river. */
+    const usable = [];
+    for (const r of roads) {
+      if (r.rank > 2) {
+        let dry = true;
+        for (const p of r.path) {
+          if (!waterFree(p.x, p.z, .1)) { dry = false; break; }
+        }
+        if (!dry) continue;
+      }
+      usable.push(r);
+    }
+    return usable;
+  }
+  /* Every point where the network meets the river becomes a bridge. The bridge
+     records the water span in its local frame so the deck can be drawn exactly
+     bank to bank, and the road that owns it knows to continue across. */
+  function placeBridges(roads, riverSamples, bank, lakeData, rand) {
+    const out = [];
+    const water = WATER;
+    for (const road of roads) {
+      const path = road.path;
+      for (let i = 1; i < path.length; i++) {
+        const ax = path[i-1].x, az = path[i-1].z, bx = path[i].x, bz = path[i].z;
+        const segLen = Math.hypot(bx - ax, bz - az);
+        if (segLen < 1e-6) continue;
+        const steps = Math.max(2, Math.ceil(segLen / (bank * .3)));
+        let runStart = null;
+        for (let s = 0; s <= steps; s++) {
+          const t = s / steps;
+          const px = ax + (bx - ax) * t, pz = az + (bz - az) * t;
+          const inWater = riverDistance(px, pz, riverSamples) <= water + .02;
+          if (inWater && runStart === null) {
+            runStart = t;
+          } else if (!inWater && runStart !== null) {
+            // Crossing closed: keep the midpoint of the stretch that was wet.
+            const tMid = (runStart + t) / 2;
+            const mid = {x: ax + (bx - ax) * tMid, z: az + (bz - az) * tMid};
+            runStart = null;
+            const dir = {x: (bx - ax) / segLen, z: (bz - az) / segLen};
+            const {lo, hi} = crossingSpan(mid, dir, riverSamples, water);
+            // Deck reaches past the promenade on both banks so no gap shows.
+            const reach = lo + (bank - water) + .15;
+            const span = lo + hi + 2 * (bank - water) + .30;
+            // A road that crosses both a lake and the river would put its bridge
+            // over open water: the whole deck has to clear every lake, not just
+            // its centre.
+            if (!lakeClear(mid.x, mid.z, Math.hypot(span, .3) / 2, lakeData)) continue;
+            out.push({
+              x: mid.x, z: mid.z,
+              angle: Math.atan2(dir.z, dir.x),
+              w: span,
+              d: .22 + rand() * .07,
+              lo: reach,
+              lane: road.w,
+              type: Math.floor(rand() * 3),
+              seedOdd: rand() < .5,
+            });
+          }
         }
       }
     }
-    bridgeData = bridgeData.filter(b => lakeClear(b.x,b.z,Math.hypot(b.w,b.d)/2,lakeData));
-    const buildingData = [], parkData = [];
-    for (let ix=0;ix<cellCount;ix++) for (let iz=0;iz<cellCount;iz++) {
-      const x = (grid[ix]+grid[ix+1])/2 + (rand()-.5)*.028;
-      const z = (grid[iz]+grid[iz+1])/2 + (rand()-.5)*.028;
-      const w = .31 + rand()*.135, d = .31 + rand()*.135;
-      const footprint = {x,z,w:w+.085,d:d+.085};
-      const radius = Math.hypot(footprint.w,footprint.d)/2;
-      if (riverDistance(x,z,riverSamples) < BANK + radius + .025) continue;
-      if (!lakeClear(x,z,radius,lakeData)) continue;
-      if (facilityData.some(b=>overlaps(footprint,b,.12))) continue;
-      if (bridgeData.some(b => overlaps(footprint,b,.055))) continue;
-      if (buildingData.some(b => overlaps(footprint,b.footprint,.065))) continue;
-      if (rand() < .13) { parkData.push(footprint); continue; }
-      const center = Math.exp(-(x*x+z*z)/(3.4*scale));
-      const h = Math.round((.28 + rand()*.58 + center*(.35+rand()*1.05))/FLOOR)*FLOOR;
-      buildingData.push({x,z,w,d,h,footprint,style:Math.floor(rand()*4),palette:Math.floor(rand()*4),detailSeed:Math.floor(rand()*0xffffffff)});
+    return clusterBridges(out);
+  }
+  function generate(seed, diameter = 3) {
+    diameter = clamp(Math.round(Number(diameter) || 3), 3, 10);
+    const half = diameter, scale = diameter / 3, extent = half + .85;
+    const rand = random(seed);
+    const phase = rand() * 6.28, amplitude = (.52 + rand() * .46) * scale, bend = (.06 + rand() * .18) * scale;
+    const samples = Math.ceil(extent * 48);
+    const riverSamples = Array.from({length: samples + 1}, (_, i) => {
+      const z = -extent + i * extent * 2 / samples;
+      return {x: Math.sin(z * .7 / scale + phase) * amplitude + Math.sin(z * 1.7 / scale + phase) * bend, z};
+    });
+    /* Channel width is drawn per seed: some cities get a narrow canal with tight
+       banks, others a broad river with long embankments. All river, bridge and
+       promenade geometry is derived from `bank`, so the two stay consistent. */
+    const bankVar = rand();
+    const bank = BANK * (.62 + bankVar * .95);      // 0.62x .. 1.57x of the default
+    const channel = bank + WATER;
+    const lakeData = [], facilityData = [];
+    if (diameter > 5) {
+      const count = diameter >= 8 ? 2 : 1;
+      for (let i = 0; i < count; i++) {
+        const sign = i === 0 ? -1 : 1, x = sign * half * .61, z = (i === 0 ? 1 : -1) * half * .37;
+        const rx = .76 + diameter * .052 + rand() * .15, rz = .67 + diameter * .065 + rand() * .13, phase2 = rand() * 6.28;
+        const points = Array.from({length: 64}, (_, j) => {
+          const angle = j * Math.PI / 32, r = 1 + .10 * Math.sin(angle * 3 + phase2) + .06 * Math.cos(angle * 5 - phase2);
+          return {x: x + Math.cos(angle) * rx * r, z: z + Math.sin(angle) * rz * r};
+        });
+        lakeData.push({x, z, rx, rz, points});
+      }
+      for (const [type, sign] of [['factory', -1], ['power', 1]]) {
+        const w = 2.35, d = 1.86;
+        for (const zSign of [-1, 1]) {
+          const site = {type, x: sign * (half - 1.5), z: zSign * (half - 1.35), w, d};
+          if (riverDistance(site.x, site.z, riverSamples) < channel + Math.hypot(w, d) / 2 + .12) continue;
+          if (!lakeClear(site.x, site.z, Math.hypot(w, d) / 2, lakeData)) continue;
+          if (facilityData.some(b => overlaps(site, b, .25))) continue;
+          facilityData.push(site);
+          break;
+        }
+      }
     }
-    if(!parkData.length && buildingData.length>1) parkData.push(buildingData.pop().footprint);
-    return {seed,diameter,half,grid,riverSamples,bridgeData,buildingData,parkData,lakeData,facilityData,buildings:buildingData.length,bridges:bridgeData.length,
-      boundary:['城墙','河岸','高山'][Math.floor(rand()*3)],version:4};
+    /* Roads first, bridges from the road/water crossings, buildings last. That
+       order is what keeps carriageways free of towers and guarantees that every
+       bridge sits on a road that actually reaches it. */
+    const roads = buildRoadNetwork(rand, half, scale, riverSamples, bank, lakeData, facilityData);
+    const bridgeData = placeBridges(roads, riverSamples, bank, lakeData, rand);
+    /* A radius test is too coarse here: the footprints are squares rotated to
+       face the street, and a corner can reach well past the inscribed radius. The
+       exact rotated-rectangle test is used so no plot grows over a deck. */
+    const onBridge = (footprint, pad) =>
+      bridgeData.some(b => overlaps(footprint, {x: b.x, z: b.z, w: b.w, d: b.d, angle: b.angle}, pad));
+
+    const buildingData = [], parkData = [];
+    const attempts = 2600;
+    for (let i = 0; i < attempts; i++) {
+      const x = (rand() - .5) * (half * 2 - .62), z = (rand() - .5) * (half * 2 - .62);
+      const w = .31 + rand() * .135, d = .31 + rand() * .135;
+      const footprint = {x, z, w: w + .085, d: d + .085};
+      const radius = Math.hypot(footprint.w, footprint.d) / 2;
+      if (Math.abs(x) + footprint.w / 2 > half - .12 || Math.abs(z) + footprint.d / 2 > half - .12) continue;
+      if (riverDistance(x, z, riverSamples) < channel + radius + .025) continue;
+      if (!lakeClear(x, z, radius, lakeData)) continue;
+      if (roadClearance(x, z, roads) < radius) continue;
+      if (onBridge(footprint, .075)) continue;
+      if (facilityData.some(b => overlaps(footprint, b, .12))) continue;
+      if (buildingData.some(b => overlaps(footprint, b.footprint, .065))) continue;
+      if (rand() < .12) {
+        if (parkData.some(p => overlaps(footprint, p, .06))) continue;
+        parkData.push(footprint);
+        continue;
+      }
+      const center = Math.exp(-(x * x + z * z) / (3.4 * scale));
+      const h = Math.round((.28 + rand() * .58 + center * (.35 + rand() * 1.05)) / FLOOR) * FLOOR;
+      buildingData.push({x, z, w, d, h, footprint, style: Math.floor(rand() * 4), palette: Math.floor(rand() * 4), detailSeed: Math.floor(rand() * 0xffffffff)});
+    }
+    if (!parkData.length && buildingData.length > 1) parkData.push(buildingData.pop().footprint);
+    return {seed, diameter, half, riverSamples, bank, channel, roads, bridgeData, buildingData, parkData, lakeData, facilityData,
+      buildings: buildingData.length, bridges: bridgeData.length,
+      boundary: ['城墙', '河岸', '高山'][Math.floor(rand() * 3)], version: 5};
   }
   function tiers(b) {
     const base = .116;
@@ -289,76 +531,189 @@ const CityModel = (() => {
     return edges;
   }
   function river(batch,layout) {
-    ribbon(batch,layout.riverSamples,BANK,.012,'paving');
-    ribbon(batch,layout.riverSamples,.255,.017,'water');
-    const edges=ribbon(batch,layout.riverSamples,.272,.012,'water');
+    const bank=layout.bank;
+    // The water keeps its natural width; the bank margin is what varies, so the
+    // promenade and embankment breathe while the channel stays a river.
+    ribbon(batch,layout.riverSamples,bank,.012,'paving');
+    ribbon(batch,layout.riverSamples,WATER,.017,'water');
+    const edges=ribbon(batch,layout.riverSamples,WATER+.017,.012,'water');
     for(let i=1;i<edges.length;i++) for(let side=0;side<2;side++) {
       const a=edges[i-1][side],b=edges[i][side];
       // Retaining walls connect the water surface to the raised promenade.
       const quad=[[a[0],.012,a[2]],[a[0],.052,a[2]],[b[0],.052,b[2]],[b[0],.012,b[2]]];
       batch.quad(side===0?quad:quad.slice().reverse(),'concrete');
       batch.beam([a[0],.055,a[2]],[b[0],.055,b[2]],.01,'metal');
-      if(i%4===0 && !layout.bridgeData.some(br=>Math.hypot(a[0]-br.x,a[2]-br.z)<.55)) {
+      if(i%4===0 && !layout.bridgeData.some(br=>Math.hypot(a[0]-br.x,a[2]-br.z)<br.w*.5+.3)) {
         batch.cylinder(.005,.006,.047,a[0],.08,a[2],'metal',6);
         batch.beam([a[0],.104,a[2]],[b[0],.104,b[2]],.003,'frame');
       }
     }
     const rand=random(layout.seed+62);
+    // Rip-rap on the banks and a promenade railing, both scaled to the bank width.
+    for(let i=0;i<Math.round(70*bank/.34);i++) {
+      const p=layout.riverSamples[4+Math.floor(rand()*(layout.riverSamples.length-8))];
+      const side=rand()<.5?-1:1, off=(WATER+.04+rand()*(bank-WATER-.02))*side;
+      const g=new THREE.DodecahedronGeometry(.03+rand()*.04,0);g.scale(1,.6,1);
+      g.translate(p.x+off,.014,p.z+off*.3);batch.geometry(g,'rock');
+    }
+    for(let i=8;i<layout.riverSamples.length-8;i+=10) {
+      const p=layout.riverSamples[i],q=layout.riverSamples[i-1],n=layout.riverSamples[i+1];
+      const l=Math.hypot(n.x-q.x,n.z-q.z)||1,nx=(n.z-q.z)/l,nz=-(n.x-q.x)/l;
+      for(const side of [-1,1]) {
+        if(layout.bridgeData.some(br=>Math.hypot(p.x-br.x,p.z-br.z)<br.w*.5+.22)) continue;
+        const x=p.x+nx*(bank-.035)*side,z=p.z+nz*(bank-.035)*side;
+        batch.box(.006,.075,.006,x,.05,z,'metal',0);
+        batch.beam([p.x+nx*(bank-.09)*side,.088,p.z+nz*(bank-.09)*side],[p.x+nx*(bank+.03)*side,.088,p.z+nz*(bank+.03)*side],.0035,'metal');
+      }
+    }
     for(let i=0;i<95;i++) {
       const p=layout.riverSamples[4+Math.floor(rand()*(layout.riverSamples.length-8))];
       batch.box(.017+rand()*.055,.001,.002,p.x+(rand()-.5)*.32,.019,p.z,'ripple',rand()*.6);
     }
   }
+  /* The deck spans exactly the water it crosses: `lo` and `hi` are measured to
+     the far edge of the water on each side, so a wide channel gets a long bridge
+     and a narrow one gets a short bridge. Approaches reach the bank road at
+     y=.013, matching the carriageway height. */
   function bridge(batch,b) {
+    const lo=Math.max(b.lo,.26), hi=Math.max(b.w-b.lo,.26);
+    const d=b.d, half=d/2, lane=b.lane||.12;
+    const deckY=.098;
     batch.at(b.x,b.z,b.angle);
-    batch.box(1.04,.047,.22,0,.097,0,'concreteDark');
-    batch.box(1.04,.008,.17,0,.125,0,'asphalt');
-    for(const side of [-1,1]) {
-      batch.box(1.055,.025,.025,0,.13,side*.102,'metal');
-      batch.beam([-.52,.191,side*.103],[.52,.191,side*.103],.006,'metal');
-      batch.box(.84,.006,.009,0,.168,side*.104,'accent');
-      for(let x=-.48;x<.51;x+=.12) batch.box(.009,.065,.009,x,.16,side*.103,'frame');
-      for(const end of [-1,1]) {
-        batch.box(.065,.086,.024,end*.40,.044,side*.077,'concrete');
-        // Bridge ramps meet the road at y=.013, with solid side faces.
-        const x0=end*.52,x1=end*.86;
-        const p=[[x0,.129,-.11],[x0,.129,.11],[x1,.013,.11],[x1,.013,-.11]];
-        if(side===-1) {
-          batch.quad(end>0?p:p.slice().reverse(),'asphalt');
-          for(const edge of [-1,1]) {
-            const q=[[x0,.007,edge*.11],[x0,.129,edge*.11],[x1,.013,edge*.11],[x1,.007,edge*.11]];
-            batch.quad((end*edge)>0?q:q.slice().reverse(),'concreteDark');
+    batch.box(lo+hi,deckY,d,0,deckY/2,0,'concreteDark');
+    batch.box(lo+hi,.008,d-.05,0,deckY+.004,0,'asphalt');
+    const rail=(z)=>{
+      batch.box(lo+hi,.025,.02,0,deckY+.021,z,'metal');
+      batch.beam([-lo,deckY+.078,z],[hi,deckY+.078,z],.005,'metal');
+      if(b.type!==2) batch.box(lo+hi-.1,.006,.008,0,deckY+.055,z,'accent');
+      for(let x=-lo+.05;x<hi;x+=.115) batch.box(.008,.058,.008,x,deckY+.048,z,'frame');
+    };
+    rail(half-.011); rail(-(half-.011));
+
+    if(b.type===0) {
+      // Twin arches: short spans get one, long spans get two supports in the river.
+      const arches=lo+hi>1.35?2:1;
+      for(let k=0;k<arches;k++){
+        const cx=-lo+(lo+hi)*(k+.5)/arches, span=(lo+hi)/arches;
+        for(const side of [-1,1]) {
+          const ribs=Math.max(3,Math.round(span/.16));
+          for(let i=0;i<=ribs;i++){
+            const t=i/ribs, x0=cx-span/2+span*t;
+            const y=deckY-Math.sin(t*Math.PI)*Math.min(deckY-.02,.112);
+            batch.box(.022,.022,d*.76,x0,y,0,'concrete');
           }
         }
       }
+      if(arches===2) batch.box(.09,.09,d,-lo+(lo+hi)*.5,deckY/2,0,'concrete');
+    } else if(b.type===1) {
+      // Cable-stayed: pylon above the deck carrying fans of stays.
+      const pylonX=(b.seedOdd?-1:1)*Math.min(.22,(lo+hi)*.16);
+      batch.box(.085,.30,d*.5,pylonX,deckY+.15,0,'concrete');
+      batch.box(.10,.02,d*.54,pylonX,deckY+.30,0,'metal');
+      for(let i=0;i<6;i++){
+        const y=deckY+.055+i*.042;
+        for(const side of [-1,1]) {
+          const x=side<0?-lo+.03:hi-.03;
+          batch.beam([pylonX,y+ .02,side*(half-.05)],[x,deckY+.03,side*(half-.05)],.0026,'frame');
+        }
+      }
+    } else {
+      // Girder: shallow beams under the deck with a light truss above.
+      for(const side of [-1,1]){
+        batch.box(lo+hi,.045,.022,0,deckY-.028,side*(half-.028),'metal');
+        for(let x=-lo+.06;x<hi;x+=.13) batch.box(.008,.038,.008,x,deckY+.036,side*(half-.011),'frame');
+      }
+      for(let x=-lo+.06;x<hi;x+=.26) batch.box(.014,.055,d*.5,x,deckY+.012,0,'frame');
+      for(const x of [-lo*.55,hi*.55]) batch.box(.075,.085,d,x,deckY/2,0,'concrete');
     }
-    for(let x=-.43;x<.5;x+=.14) batch.box(.06,.002,.005,x,.131,0,'marking');
+
+    for(const end of [-1,1]) {
+      const x0=end*lo, x1=end*(lo+.34);
+      batch.quad(end>0
+        ? [[x0,deckY+.004,-half],[x0,deckY+.004,half],[x1,.013,half],[x1,.013,-half]]
+        : [[x1,.013,-half],[x1,.013,half],[x0,deckY+.004,half],[x0,deckY+.004,-half]],'asphalt');
+      for(const edge of [-1,1]) {
+        const q=[[x0,.007,edge*half],[x0,deckY+.004,edge*half],[x1,.013,edge*half],[x1,.007,edge*half]];
+        batch.quad((end*edge)>0?q:q.slice().reverse(),'concreteDark');
+      }
+      batch.box(.07,.092,quarter(d),end*(lo+.06),.046,half-.075,'concrete');
+      batch.box(.07,.092,quarter(d),end*(lo+.06),.046,-(half-.075),'concrete');
+    }
+    function quarter(dd){ return Math.min(.05,dd*.22); }
+    for(let x=-lo+.06;x<hi;x+=.14) batch.box(.055,.002,.005,x,deckY+.009,0,'marking');
     batch.at(0,0);
   }
   function roadAndLandscape(batch,layout) {
-    const open=(x,z,r=.07)=>riverDistance(x,z,layout.riverSamples)>BANK+r && lakeClear(x,z,r,layout.lakeData) && !layout.facilityData.some(b=>overlaps({x,z,w:r*2,d:r*2},b,.08)) && !layout.bridgeData.some(b=>overlaps({x,z,w:r*2,d:r*2},b));
-    for(const axis of [0,1]) for(const line of layout.grid) for(let p=-layout.half+.03;p<layout.half;p+=.07) {
-      const x=axis?p:line,z=axis?line:p;
-      if(!open(x,z)) continue;
-      batch.box(axis ? .071 : .115,.008,axis ? .115 : .071,x,.005,z,'asphalt');
-      for(const side of [-1,1]) batch.box(axis ? .071 : .018,.017,axis ? .018 : .071,x+(axis?0:side*.070),.009,z+(axis?side*.070:0),'paving');
-      if(Math.round((p+2.99)/.07)%3===0) batch.box(axis ? .037 : .005,.001,axis ? .005 : .037,x,.010,z,'marking');
-    }
+    const roads=layout.roads, bridges=layout.bridgeData;
     const rand=random(layout.seed+19);
-    for(const x of layout.grid) for(const z of layout.grid) {
-      if(!open(x,z,.12)) continue;
-      for(let k=0;k<4;k++) batch.box(.008,.001,.053,x+(k-1.5)*.017,.011,z+.103,'marking');
-      const lx=x+.082,lz=z+.082;
-      if(!open(lx,lz,.03)) continue;
-      batch.cylinder(.005,.008,.105,lx,.058,lz,'frame',6);
-      batch.box(.036,.009,.013,lx-.014,.112,lz,'metal');
-      batch.box(.025,.002,.009,lx-.014,.108,lz,'windowWarm');
-      if(rand()<.55 && !layout.buildingData.some(b=>overlaps({x:x-.13,z:z-.13,w:.14,d:.14},b.footprint))) tree(batch,x-.13,z-.13,.085+rand()*.04);
-      // Low-profile vehicles scale to the carriageway, not to the towers.
-      if(rand()<.38 && open(x-.025,z+.21,.05)) {
-        batch.box(.027,.017,.065,x-.025,.019,z+.21,'metal');
-        batch.box(.024,.012,.032,x-.025,.033,z+.212,'windowDark');
-        batch.box(.019,.004,.003,x-.025,.021,z+.177,'windowWarm');
+    // Passing under a bridge would put tarmac through the deck, so the
+    // carriageway is suppressed inside a bridge's footprint.
+    const overBridge=(x,z)=>bridges.some(b=>Math.abs((x-b.x)*Math.cos(b.angle)+(z-b.z)*Math.sin(b.angle))<b.w/2+.02
+      && Math.abs(-(x-b.x)*Math.sin(b.angle)+(z-b.z)*Math.cos(b.angle))<b.d/2+.02);
+    const inRiver=(x,z)=>riverDistance(x,z,layout.riverSamples)<=layout.bank+.015;
+    for(const road of roads) {
+      const w=road.w, sw=road.sw;
+      for(let i=1;i<road.path.length;i++) {
+        const a=road.path[i-1], b=road.path[i];
+        const len=Math.hypot(b.x-a.x,b.z-a.z);
+        if(len<1e-4) continue;
+        const angle=Math.atan2(b.z-a.z,b.x-a.x);
+        const nx=(b.z-a.z)/len, nz=-(b.x-a.x)/len;
+        const steps=Math.max(1,Math.round(len/.075));
+        for(let s=0;s<steps;s++) {
+          const t0=s/steps, t1=(s+1)/steps;
+          const mx=a.x+(b.x-a.x)*(t0+t1)/2, mz=a.z+(b.z-a.z)*(t0+t1)/2;
+          if(overBridge(mx,mz)) continue;
+          const segLen=len/steps+.012;
+          batch.at(mx,mz,angle);
+          // A road that meets the river without a bridge stops at the bank.
+          if(!inRiver(mx,mz)) {
+            batch.box(segLen,.010,w,0,.005,0,'asphalt');
+            if(road.rank<=1 && s%2===0) batch.box(.042,.002,.006,0,.011,0,'marking');
+          }
+          for(const side of [-1,1]) {
+            const sx=mx+nx*(w/2+sw/2)*side, sz=mz+nz*(w/2+sw/2)*side;
+            if(inRiver(sx,sz)) continue;
+            batch.at(sx,sz,angle);
+            batch.box(segLen,.008,sw,0,.005,0,'paving');
+          }
+        }
+      }
+      // Street furniture follows the road instead of a fixed grid.
+      for(let i=1;i<road.path.length;i++) {
+        const a=road.path[i-1], b=road.path[i];
+        const len=Math.hypot(b.x-a.x,b.z-a.z);
+        if(len<.3) continue;
+        const angle=Math.atan2(b.z-a.z,b.x-a.x);
+        const nx=(b.z-a.z)/len, nz=-(b.x-a.x)/len;
+        for(let s=0;s<len;s+=.30) {
+          const t=s/len;
+          const px=a.x+(b.x-a.x)*t, pz=a.z+(b.z-a.z)*t;
+          if(inRiver(px,pz)||overBridge(px,pz)) continue;
+          const side=(Math.round(s/.30)%2)?1:-1;
+          const lx=px+nx*(w/2+sw-.03)*side, lz=pz+nz*(w/2+sw-.03)*side;
+          if(!lakeClear(lx,lz,.05,layout.lakeData)) continue;
+          batch.at(lx,lz,angle);
+          batch.box(.005,.075,.005,0,.048,0,'frame');
+          batch.box(.032,.008,.012,.011,.089,0,'metal');
+          batch.box(.022,.002,.008,.011,.085,0,'windowWarm');
+          batch.at(0,0);
+          if(rand()<.30) {
+            const vx=px+nx*(w*.22)*side, vz=pz+nz*(w*.22)*side;
+            if(inRiver(vx,vz)||overBridge(vx,vz)) continue;
+            batch.at(vx,vz,angle);
+            batch.box(.062,.017,.026,0,.019,0,'metal');
+            batch.box(.030,.012,.024,0,.033,0,'windowDark');
+            batch.box(.003,.004,.018,-.031,.021,0,'windowWarm');
+            batch.at(0,0);
+          }
+          if(rand()<.22 && road.rank>=2) {
+            const tx=px-nx*(w/2+sw+.085)*side, tz=pz-nz*(w/2+sw+.085)*side;
+            if(inRiver(tx,tz)||overBridge(tx,tz)) continue;
+            if(layout.buildingData.some(b=>overlaps({x:tx,z:tz,w:.12,d:.12},b.footprint))) continue;
+            tree(batch,tx,tz,.085+rand()*.04);
+          }
+        }
       }
     }
     for(const park of layout.parkData) {
@@ -459,7 +814,7 @@ const CityModel = (() => {
       const along=-half+i*.24, angle=side*Math.PI/2;
       const x=Math.cos(angle)*along+Math.sin(angle)*(half+.08);
       const z=-Math.sin(angle)*along+Math.cos(angle)*(half+.08);
-      if(riverDistance(x,z,layout.riverSamples)<BANK+.20) continue;
+      if(riverDistance(x,z,layout.riverSamples)<layout.channel+.20) continue;
       batch.at(x,z,angle);
       if(layout.boundary==='城墙') {
         // Segmented concrete plinth, inset armour, coping and external buttress.
