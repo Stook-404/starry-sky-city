@@ -67,3 +67,24 @@ tests/city-model.test.cjs   模型测试
 ## 第三方组件
 
 `vendor/` 目录内含 [Three.js](https://threejs.org/)，遵循其 MIT 许可证。
+
+---
+
+## 许可证
+
+本项目采用 [MIT 许可证](LICENSE)。
+
+`vendor/` 目录内含 [Three.js](https://threejs.org/)，版权归 Three.js Authors
+所有，同样以 MIT 许可证授权：
+
+> Copyright © 2010-2026 three.js authors
+>
+> Permission is hereby granted, free of charge, to any person obtaining a copy
+> of this software and associated documentation files (the "Software"), to deal
+> in the Software without restriction, including without limitation the rights
+> to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+> copies of the Software, and to permit persons to whom the Software is
+> furnished to do so, subject to the following conditions:
+>
+> The above copyright notice and this permission notice shall be included in
+> all copies or substantial portions of the Software.
